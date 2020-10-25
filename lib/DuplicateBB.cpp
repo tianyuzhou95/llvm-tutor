@@ -3,150 +3,158 @@
 //    DuplicateBB.cpp
 //
 //  DESCRIPTION:
-//    Obfuscation through duplication of Basic blocks guarded This clones some
-//    basic blocks, guarded by a condition that depends on the context. Each
-//    branch should then be obfuscated in different ways.
+//    For the input function F, DuplicateBB first creates a list of BasicBlocks
+//    that are suitable for cloning and then clones them. A BasicBlock BB is
+//    suitable for cloning iff its set of RIVs (Reachable Integer Values) is
+//    non-empty.
+//
+//    If BB is suitable for cloning, in total four new basic blocks are created
+//    that replace BB:
+//      * lt-clone-1 and lt-clone-2 are clones of BB
+//      * lt-if-then-else contains an `if-then-else` statement that's used to
+//        decide which out of the two clones to branch two
+//      * lt-tail contains PHI nodes and is used to merge lt-clone-1 and
+//        lt-clone-2
+//    This if-then-else basic blocks contains an IR equivalent of the following
+//    pseudo code:
+//      if (var == 0)
+//        goto BB-if-then
+//      else
+//        goto BB-else
+//    `var` is a randomly chosen variable from the RIV set for BB. If `var`
+//    happens to be a GlobalValue (i.e. global variable), BB won't be
+//    duplicated. That's because global variables are often constants, and
+//    constant values lead to trivial `if` conditions (e.g. if ( 0 == 0 )).
+//
+//    All newly created basic blocks are suffixed with the original basic
+//    block's numeric ID.
 //
 //  ALGORITHM:
-//    ----------------------------------------------------------
-//    The following CFG graphs present function 'F' before and after applying
-//    DuplicateBB. BB0 is the entry block. Assume that there are no global
-//    variables and F takes no arguments, hence BB0 is not split.
-//    ----------------------------------------------------------
-//    F - BEFORE         F - AFTER
-//    ----------------------------------------------------------
-//      BB0                BB0
-//       |                  |
-//       v                  v
-//      BB1             bool cond. 1   <----  some condition
-//       |                 / \
-//       |               /     \
-//       |         BB1-then   BB1-else <---- clones of BB1
-//       |               \     /
-//       |                 \ /
-//       |                  v
-//       v                TAIL         <---- PHI nodes that merge two branches
-//      BB2             bool cond. 2   <---- another bool cond.
-//       |                 / \
-//       |               /     \
-//       |         BB2-then   BB2-else <---- clones of BB2
-//       |               \     /
-//       |                 \ /
-//       |                  v
-//       v                TAIL         <---- PHI nodes that merge two branches
-//     TERM               TERM         <---- terminator instruction
-//    ----------------------------------------------------------
+//    --------------------------------------------------------------------------
+//    The following CFG graph represents function 'F' before and after applying
+//    DuplicateBB. Assume that:
+//      * F takes no arguments so [ entry ] is not duplicated
+//      * [ BB1 ] and [ BB2 ] are suitable for cloning
+//    --------------------------------------------------------------------------
+//    F - BEFORE     (equivalence)          F - AFTER
+//    --------------------------------------------------------------------------
+//    [ entry ]                              [ entry ]                         |
+//        |                                      |                             |
+//        v            _________                 v                             e
+//        |           |                  [ if-then-else-1 ]                    x
+//        |           |                         / \                            e
+//        |           |                       /     \                          c
+//        |           |          [ lt-clone-1-1 ] [ lt-clone-2-1 ]             u
+//     [ BB1 ]       <                        \     /                          t
+//        |           |                         \ /                            i
+//        |           |                          v                             o
+//        |           |                    [ lt-tail-1 ]                       n
+//        |           |_________                 |                             |
+//        v            _________                 v                             d
+//        |           |                 [ lt-if-then-else-2 ]                  i
+//        |           |                         / \                            r
+//        |           |                       /     \                          e
+//        |           |          [ lt-clone-1-2 ] [ lt-clone-2-2 ]             c
+//     [ BB2 ]       <                        \     /                          t
+//        |           |                         \ /                            i
+//        |           |                          v                             o
+//        |           |                   [ lt-tail-2 ]                        n
+//        |           |_________                 |                             |
+//        v                                      v                             |
+//      (...)                                  (...)                           V
+//    --------------------------------------------------------------------------
+//
+//  USAGE:
+//    1. Legacy Pass Manager:
+//      $ opt -load <BUILD_DIR>/lib/libRIV.so `\`
+//        -load <BUILD_DIR>/lib/libDuplicateBB%shlibext -legacy-duplicate-bb `\`
+//        -S <bitcode-file>
+//    2. New Pass Manager:
+//      $ opt -load-pass-plugin <BUILD_DIR>/lib//libRIV.so `\`
+//      -load-pass-plugin <BUILD_DIR>/lib//libDuplicateBB.so `\`
+//      -passes=duplicate-bb -S <bitcode-file>
+//
+// REFERENCES:
+//    Based on examples from: 
+//    "Building, Testing and Debugging a Simple out-of-tree LLVM Pass", Serge
+//    Guelton and Adrien Guinet, LLVM Dev Meeting 2015
 //
 // License: MIT
 //==============================================================================
 #include "DuplicateBB.h"
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstrTypes.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
-#include "RIV.h"
-#include "Ratio.h"
+#include <random>
 
 #define DEBUG_TYPE "duplicate-bb"
 
-STATISTIC(DuplicateBBCount, "The # of duplicated blocks");
-
-// Pass Option declaration
-static llvm::cl::opt<Ratio> DuplicateBBRatio{
-    "duplicate-bb-ratio",
-    llvm::cl::desc("Only apply the duplicate basic block "
-                   "pass on <ratio> of the basic blocks"),
-    llvm::cl::value_desc("ratio"), llvm::cl::init(1.), llvm::cl::Optional};
+STATISTIC(DuplicateBBCountStats, "The # of duplicated blocks");
 
 using namespace llvm;
-using lt::DuplicateBB;
 
-namespace lt {
-char DuplicateBB::ID = 0;
+//------------------------------------------------------------------------------
+// DuplicateBB Implementation
+//------------------------------------------------------------------------------
+DuplicateBB::BBToSingleRIVMap
+DuplicateBB::findBBsToDuplicate(Function &F, const RIV::Result &RIVResult) {
+  BBToSingleRIVMap BlocksToDuplicate;
 
-// Register the pass - required for (among others) opt
-static RegisterPass<lt::DuplicateBB>
-    X("duplicate-bb", "Duplicate Basic Blocks Pass",
-      false, // does modify the CFG => false
-      false  // not a pure analysis pass => false
-    );
-} // namespace lt
+  // Get a random number generator. This will be used to choose a context
+  // value for the injected `if-then-else` construct.
+  // FIXME Switch to 'F.getParent()->createRNG("DuplicateBB")' once possible.
+  // This patch implements the necessary API:
+  //    * https://reviews.llvm.org/rG73713f3e5ef2ecf1e5afafa89f76ab89cc06b18e
+  // It should be available in LLVM 11.
+  std::random_device RD;
+  std::mt19937_64 RNG(RD());
 
-// Called once for each module (i.e. before the pass is run on any on any
-// function)
-bool DuplicateBB::doInitialization(Module &M) {
-  RNG = M.createRNG(this);
-  return false;
-}
-
-bool DuplicateBB::runOnFunction(Function &F) {
-  // Radio and Dist are used to decide whether to duplicate the current BB - it
-  // allows control from the user (Ratio is the CL argument).
-  double const Ratio = DuplicateBBRatio.getValue().getRatio();
-  std::uniform_real_distribution<double> Dist(0., 1.);
-
-  // Get the result of RIV
-  auto const &RIVResult = getAnalysis<RIV>().getRIVMap();
-
-  // The list of BBs to duplicate. For each BB, also stores a context variable
-  // that can be used for the boolean condition for the 'if-then-else'
-  // construct. It's a randomly picked variable that's reachable in the current
-  // BB (that's why RIV is needed here). The actual doesn't matter.
-  std::vector<std::tuple<BasicBlock *, Value *>> Targets;
-
-  // Run over all BBs in F and find the one that are suitable for duplication.
   for (BasicBlock &BB : F) {
     // Basic blocks which are landing pads are used for handling exceptions.
     // That's out of scope of this pass.
     if (BB.isLandingPad())
       continue;
 
-    if (Dist(*RNG) <= Ratio) {
-      // Are there any integer values reachable from this BB?
-      auto const &ReachableValues = RIVResult.lookup(&BB);
-      size_t ReachableValuesCount = ReachableValues.size();
-      if (0 != ReachableValuesCount) {
-        // Yes, pick a random one.
-        std::uniform_int_distribution<size_t> Dist(0, ReachableValuesCount - 1);
-        auto Iter = ReachableValues.begin();
-        std::advance(Iter, Dist(*RNG));
-        LLVM_DEBUG(errs() << "picking: " << **Iter
-                          << " as random context value\n");
-        // Store the binding and a BB to duplicate and the context variable
-        // used to hide it
-        Targets.emplace_back(&BB, *Iter);
+    // Get the set of RIVs for this block
+    auto const &ReachableValues = RIVResult.lookup(&BB);
+    size_t ReachableValuesCount = ReachableValues.size();
 
-        ++DuplicateBBCount;
-      } else {
-        LLVM_DEBUG(errs() << "no context value found\n");
-      }
+    // Are there any RIVs for this BB? We need at least one to be able to
+    // duplicate this BB.
+    if (0 == ReachableValuesCount) {
+      LLVM_DEBUG(errs() << "No context values for this BB\n");
+      continue;
     }
+
+    // Get a random context value from the RIV set
+    auto Iter = ReachableValues.begin();
+    std::uniform_int_distribution<> Dist(0, ReachableValuesCount - 1);
+    std::advance(Iter, Dist(RNG));
+
+    if (dyn_cast<GlobalValue>(*Iter)) {
+      LLVM_DEBUG(errs() << "Random context value is a global variable. "
+                        << "Skipping this BB\n");
+      continue;
+    }
+
+    LLVM_DEBUG(errs() << "Random context value: " << **Iter << "\n");
+
+    // Store the binding between the current BB and the context variable that
+    // will be used for the `if-then-else` construct.
+    BlocksToDuplicate.emplace_back(&BB, *Iter);
   }
 
-  // This pass modifies values and so it needs to keep track of the new
-  // bindings. Otherwise, the information from RIV will be obsolete.
-  std::map<Value *, Value *> ReMapper;
-
-  // Finally, duplicate
-  for (auto &BB_Ctx : Targets) {
-    duplicate(*std::get<0>(BB_Ctx), std::get<1>(BB_Ctx), ReMapper);
-  }
-
-  // Has anything been modified?
-  return !Targets.empty();
+  return BlocksToDuplicate;
 }
 
-void DuplicateBB::duplicate(BasicBlock &BB, Value *ContextValue,
-                            std::map<Value *, Value *> &ReMapper) {
-  // Don't duplicate phi nodes - start right after them
+void DuplicateBB::cloneBB(BasicBlock &BB, Value *ContextValue,
+                          ValueToPhiMap &ReMapper) {
+  // Don't duplicate Phi nodes - start right after them
   Instruction *BBHead = BB.getFirstNonPHI();
 
   // Create the condition for 'if-then-else'
@@ -160,24 +168,33 @@ void DuplicateBB::duplicate(BasicBlock &BB, Value *ContextValue,
   Instruction *ThenTerm = nullptr;
   Instruction *ElseTerm = nullptr;
   SplitBlockAndInsertIfThenElse(Cond, &*BBHead, &ThenTerm, &ElseTerm);
-
   BasicBlock *Tail = ThenTerm->getSuccessor(0);
-  assert(Tail == ElseTerm->getSuccessor(0));
 
-  // To keep track of the new bindings.
+  assert(Tail == ElseTerm->getSuccessor(0) && "Inconsistent CFG");
+
+  // Give the new basic blocks some meaningful names. This is not required, but
+  // makes the output easier to read.
+  std::string DuplicatedBBId = std::to_string(DuplicateBBCount);
+  ThenTerm->getParent()->setName("lt-clone-1-" + DuplicatedBBId);
+  ElseTerm->getParent()->setName("lt-clone-2-" + DuplicatedBBId);
+  Tail->setName("lt-tail-" + DuplicatedBBId);
+  ThenTerm->getParent()->getSinglePredecessor()->setName("lt-if-then-else-" +
+                                                         DuplicatedBBId);
+
+  // Variables to keep track of the new bindings
   ValueToValueMapTy TailVMap, ThenVMap, ElseVMap;
 
-  // The list of instructions in Tail that don't produce any values and can be
-  // removed.
+  // The list of instructions in Tail that don't produce any values and thus
+  // can be removed
   SmallVector<Instruction *, 8> ToRemove;
 
   // Iterate through the original basic block and clone every instruction into
-  // the 'then' and 'else' branches. Update the bindings/uses as on the fly
-  // (through ThenVMap, ElseVMap, TailVMap). At this stage, all the instruction
+  // the 'if-then' and 'else' branches. Update the bindings/uses on the fly
+  // (through ThenVMap, ElseVMap, TailVMap). At this stage, all instructions
   // apart from PHI nodes, are stored in Tail.
   for (auto IIT = Tail->begin(), IE = Tail->end(); IIT != IE; ++IIT) {
     Instruction &Instr = *IIT;
-    assert(!isa<PHINode>(&Instr) && "phi nodes have already been filtered out");
+    assert(!isa<PHINode>(&Instr) && "Phi nodes have already been filtered out");
 
     // Skip terminators - duplicating them wouldn't make sense unless we want
     // to delete Tail completely.
@@ -204,32 +221,100 @@ void DuplicateBB::duplicate(BasicBlock &BB, Value *ContextValue,
     // Instructions that don't produce values can be safely removed from Tail
     if (ThenClone->getType()->isVoidTy()) {
       ToRemove.push_back(&Instr);
-    } else {
-      // instruction that produce a value should not require a slot in the
-      // TAIL *but* they can be used from the context, so just always
-      // generate a PHI, and let further optimization do the cleaning
-      PHINode *Phi = PHINode::Create(ThenClone->getType(), 3);
-      Phi->addIncoming(ThenClone, ThenTerm->getParent());
-      Phi->addIncoming(ElseClone, ElseTerm->getParent());
-      TailVMap[&Instr] = Phi;
-
-      ReMapper[&Instr] = Phi;
-
-      // Instructions are modified as we go, use the iterator version of
-      // ReplaceInstWithInst.
-      ReplaceInstWithInst(Tail->getInstList(), IIT, Phi);
+      continue;
     }
+
+    // Instruction that produce a value should not require a slot in the
+    // TAIL *but* they can be used from the context, so just always
+    // generate a PHI, and let further optimization do the cleaning
+    PHINode *Phi = PHINode::Create(ThenClone->getType(), 3);
+    Phi->addIncoming(ThenClone, ThenTerm->getParent());
+    Phi->addIncoming(ElseClone, ElseTerm->getParent());
+    TailVMap[&Instr] = Phi;
+
+    ReMapper[&Instr] = Phi;
+
+    // Instructions are modified as we go, use the iterator version of
+    // ReplaceInstWithInst.
+    ReplaceInstWithInst(Tail->getInstList(), IIT, Phi);
   }
 
   // Purge instructions that don't produce any value
   for (auto *I : ToRemove)
     I->eraseFromParent();
+
+  ++DuplicateBBCount;
 }
 
-// Some guidance for PassManager:
-//    * addRequired<RIV>() - needs the results from RIV Pass
-// More info:
-// http://llvm.org/docs/WritingAnLLVMPass.html#specifying-interactions-between-passes
-void DuplicateBB::getAnalysisUsage(AnalysisUsage &Info) const {
-  Info.addRequired<RIV>();
+PreservedAnalyses DuplicateBB::run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &FAM) {
+  BBToSingleRIVMap Targets = findBBsToDuplicate(F, FAM.getResult<RIV>(F));
+
+  // This map is used to keep track of the new bindings. Otherwise, the
+  // information from RIV will become obsolete.
+  ValueToPhiMap ReMapper;
+
+  // Duplicate
+  for (auto &BB_Ctx : Targets) {
+    cloneBB(*std::get<0>(BB_Ctx), std::get<1>(BB_Ctx), ReMapper);
+  }
+
+  DuplicateBBCountStats = DuplicateBBCount;
+  return (Targets.empty() ? llvm::PreservedAnalyses::all()
+                          : llvm::PreservedAnalyses::none());
 }
+
+bool LegacyDuplicateBB::runOnFunction(llvm::Function &F) {
+  // Find BBs to duplicate
+  DuplicateBB::BBToSingleRIVMap Targets =
+      Impl.findBBsToDuplicate(F, getAnalysis<LegacyRIV>().getRIVMap());
+
+  // This map is used to keep track of the new bindings. Otherwise, the
+  // information from RIV will become obsolete.
+  DuplicateBB::ValueToPhiMap ReMapper;
+
+  // Duplicate
+  for (auto &BB_Ctx : Targets) {
+    Impl.cloneBB(*std::get<0>(BB_Ctx), std::get<1>(BB_Ctx), ReMapper);
+  }
+
+  DuplicateBBCountStats = Impl.DuplicateBBCount;
+  return (Targets.empty() ? false : true);
+}
+
+//------------------------------------------------------------------------------
+// New PM Registration
+//------------------------------------------------------------------------------
+llvm::PassPluginLibraryInfo getDuplicateBBPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "duplicate-bb", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "duplicate-bb") {
+                    FPM.addPass(DuplicateBB());
+                    return true;
+                  }
+                  return false;
+                });
+          }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return getDuplicateBBPluginInfo();
+}
+
+//------------------------------------------------------------------------------
+// Legacy PM Registration
+//------------------------------------------------------------------------------
+// This method defines how this pass interacts with other passes
+void LegacyDuplicateBB::getAnalysisUsage(AnalysisUsage &Info) const {
+  Info.addRequired<LegacyRIV>();
+}
+
+char LegacyDuplicateBB::ID = 0;
+static RegisterPass<LegacyDuplicateBB> X(/*PassArg=*/"legacy-duplicate-bb",
+                                         /*Name=*/"Duplicate Basic Blocks Pass",
+                                         /*CFGOnly=*/false,
+                                         /*is_analysis=*/false);

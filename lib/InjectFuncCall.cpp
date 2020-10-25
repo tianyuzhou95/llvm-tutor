@@ -22,16 +22,17 @@
 //
 // USAGE:
 //    1. Legacy pass manager:
-//      $ opt -load <BUILD_DIR>/lib/libInjectFuncCall.so --legacy-inject-func-call <bitcode-file>
+//      $ opt -load <BUILD_DIR>/lib/libInjectFuncCall.so `\`
+//        --legacy-inject-func-call <bitcode-file>
 //    2. New pass maanger:
-//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libInjectFunctCall.so -passes=-"inject-func-call" <bitcode-file>
+//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libInjectFunctCall.so `\`
+//        -passes=-"inject-func-call" <bitcode-file>
 //
 // License: MIT
 //========================================================================
 #include "InjectFuncCall.h"
 
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Constants.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/PassBuilder.h"
 
@@ -154,7 +155,5 @@ char LegacyInjectFuncCall::ID = 0;
 
 // Register the pass - required for (among others) opt
 static RegisterPass<LegacyInjectFuncCall>
-    X("legacy-inject-func-call", "Inject ",
-      false, // does modify the CFG => false
-      false  // not a pure analysis pass => false
-    );
+    X(/*PassArg=*/"legacy-inject-func-call", /*Name=*/"LegacyInjectFuncCall",
+      /*CFGOnly=*/false, /*is_analysis=*/false);

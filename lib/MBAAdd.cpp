@@ -10,33 +10,29 @@
 //
 // USAGE:
 //    1. Legacy pass manager:
-//      $ opt -load <BUILD_DIR>/lib/libMBAAdd.so --legacy-mba-add [-mba-ratio=<ratio>] <bitcode-file>
+//      $ opt -load <BUILD_DIR>/lib/libMBAAdd.so `\`
+//        --legacy-mba-add [-mba-ratio=<ratio>] <bitcode-file>
 //      with the optional ratio in the range [0, 1.0].
 //    2. New pass maanger:
-//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libMBAAdd.so -passes=-"mba-add" <bitcode-file>
+//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libMBAAdd.so `\`
+//        -passes=-"mba-add" <bitcode-file>
 //      The command line option is not available for the new PM
 //
+//  
 // [1] "Defeating MBA-based Obfuscation" Ninon Eyrolles, Louis Goubin, Marion
 //     Videau
 //
 // License: MIT
 //==============================================================================
 #include "MBAAdd.h"
-#include "Ratio.h"
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstrTypes.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+
+#include "Ratio.h"
 
 #include <random>
 
@@ -194,8 +190,7 @@ llvmGetPassPluginInfo() {
 //-----------------------------------------------------------------------------
 char LegacyMBAAdd::ID = 0;
 
-static RegisterPass<LegacyMBAAdd> X("legacy-mba-add",
-                                    "Mixed Boolean Arithmetic Substitution",
-                                    true, // doesn't modify the CFG => true
-                                    false // not a pure analysis pass => false
-);
+static RegisterPass<LegacyMBAAdd> X(/*PassArg=*/"legacy-mba-add",
+                                    /*Name=*/"MBAAdd",
+                                    /*CFGOnly=*/true,
+                                    /*is_analysis=*/false);

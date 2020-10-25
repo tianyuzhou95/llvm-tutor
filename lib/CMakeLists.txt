@@ -8,6 +8,8 @@ set(LLVM_TUTOR_PLUGINS
     MBASub
     RIV
     DuplicateBB
+    OpcodeCounter
+    MergeBB
     )
 
 set(StaticCallCounter_SOURCES
@@ -25,8 +27,11 @@ set(MBASub_SOURCES
 set(RIV_SOURCES
   RIV.cpp)
 set(DuplicateBB_SOURCES
-  DuplicateBB.cpp
-  Ratio.cpp)
+  DuplicateBB.cpp)
+set(OpcodeCounter_SOURCES
+  OpcodeCounter.cpp)
+set(MergeBB_SOURCES
+  MergeBB.cpp)
 
 # CONFIGURE THE PLUGIN LIBRARIES
 # ==============================
@@ -41,7 +46,7 @@ foreach( plugin ${LLVM_TUTOR_PLUGINS} )
     # Configure include directories for 'plugin'
     target_include_directories(
       ${plugin}
-      PUBLIC
+      PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/../include"
     )
 

@@ -1,37 +1,48 @@
-//========================================================================
+//==============================================================================
 // FILE:
 //    StaticCallCounter.cpp
 //
 // DESCRIPTION:
-//    Counts the number of direct function calls (i.e. as seen in the source
-//    code) in a file.
+//    Counts the number of static function calls in the input module. `Static`
+//    refers to the fact that the analysed functions calls are compile-time
+//    calls (as opposed to `dynamic`, i.e. run-time). Only direct function
+//    calls are considered. Calls via functions pointers are not taken into
+//    account.
+//
+//    This is a reference analysis pass:
+//      * it inherits from llvm::AnalysisInfoMixin (New PM API)
+//      * it implements a print method (Legacy PM API)
+//
+//    The `print` method (Legacy PM) is called when running opt with the
+//    `-analyze` flag. As the new PM has no equivalent of the `print method, it
+//    is currently not possible to print the results of this pass when:
+//      * running StaticCalCounter through opt and using the new PM.
+//    However, StaticCallCounter does implement the new PM interface.
+//    It is used in `static`, a tool implemented in tools/StaticMain.cpp that
+//    is a wrapper around StaticCallCounter and that can be used as a
+//    standalone tool. `static` always prints the results of the analysis.
 //
 // USAGE:
-//    1. Run through opt - legacy pass manager
+//    1. Legacy PM - run through opt:
 //      opt -load <BUILD/DIR>/lib/libStaticCallCounter.so --legacy-static-cc
 //      -analyze <input-llvm-file>
-//    2. You can also run it through 'static':
+//    2. New PM - run through 'static':
 //      <BUILD/DIR>/bin/static <input-llvm-file>
 //
 // License: MIT
-//========================================================================
+//==============================================================================
 #include "StaticCallCounter.h"
 
-#include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Instruction.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/Format.h"
 
 using namespace llvm;
 
-//-----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
 // StaticCallCounter Implementation
-//-----------------------------------------------------------------------------
-AnalysisKey StaticCallCounter::Key;
-
+//------------------------------------------------------------------------------
 StaticCallCounter::Result StaticCallCounter::runOnModule(Module &M) {
-  llvm::DenseMap<const llvm::Function *, unsigned> Res;
+  llvm::MapVector<const llvm::Function *, unsigned> Res;
 
   for (auto &Func : M) {
     for (auto &BB : Func) {
@@ -40,8 +51,6 @@ StaticCallCounter::Result StaticCallCounter::runOnModule(Module &M) {
         // the base class CallSiteBase), ImmutableCallSite constructor creates
         // a valid call-site or NULL for something which is NOT a call site.
         auto ICS = ImmutableCallSite(&Ins);
-
-        // Check whether the instruction is actually a call/invoke
         if (nullptr == ICS.getInstruction()) {
           continue;
         }
@@ -71,18 +80,20 @@ StaticCallCounter::run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
   return runOnModule(M);
 }
 
-void LegacyStaticCallCounter::print(raw_ostream &OutS, Module const *) const {
-  printStaticCCResult(OutS, DirectCalls);
-}
-
 bool LegacyStaticCallCounter::runOnModule(llvm::Module &M) {
   DirectCalls = Impl.runOnModule(M);
   return false;
 }
 
-//-----------------------------------------------------------------------------
+void LegacyStaticCallCounter::print(raw_ostream &OutS, Module const *) const {
+  printStaticCCResult(OutS, DirectCalls);
+}
+
+//------------------------------------------------------------------------------
 // New PM Registration
-//-----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+AnalysisKey StaticCallCounter::Key;
+
 llvm::PassPluginLibraryInfo getStaticCallCounterPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "static-cc", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
@@ -98,17 +109,17 @@ llvmGetPassPluginInfo() {
   return getStaticCallCounterPluginInfo();
 }
 
-//-----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
 // Legacy PM Registration
-//-----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
 char LegacyStaticCallCounter::ID = 0;
 
 // Register the pass - required for (among others) opt
 RegisterPass<LegacyStaticCallCounter>
-    X("legacy-static-cc", "For each function print the number of direct calls",
-      true, // Doesn't modify the CFG => true
-      true  // It's a pure analysis pass => true
-    );
+    X(/*PassArg=*/"legacy-static-cc",
+      /*Name=*/"LegacyStaticCallCounter",
+      /*CFGOnly=*/true,
+      /*is_analysis=*/true);
 
 //------------------------------------------------------------------------------
 // Helper functions
@@ -124,24 +135,11 @@ void printStaticCCResult(raw_ostream &OutS, const ResultStaticCC &DirectCalls) {
   OutS << "-------------------------------------------------"
        << "\n";
 
-  // Generate a vector of captured functions, sorted alphabetically by function
-  // names. The solution implemented here is a suboptimal - a separate
-  // container with functions is created for sorting.
-  // TODO Make this more elegant (i.e. avoid creating a separate container)
-  std::vector<const Function *> FuncNames;
-  FuncNames.reserve(DirectCalls.size());
   for (auto &CallCount : DirectCalls) {
-    FuncNames.push_back(CallCount.getFirst());
+    OutS << format("%-20s %-10lu\n", CallCount.first->getName().str().c_str(),
+                   CallCount.second);
   }
-  std::sort(FuncNames.begin(), FuncNames.end(),
-            [](const Function *x, const Function *y) {
-              return (x->getName().str() < y->getName().str());
-            });
 
-  // Print functions (alphabetically)
-  for (auto &Func : FuncNames) {
-    unsigned NumDirectCalls = (DirectCalls.find(Func))->getSecond();
-    OutS << format("%-20s %-10lu\n", Func->getName().str().c_str(),
-                   NumDirectCalls);
-  }
+  OutS << "-------------------------------------------------"
+       << "\n\n";
 }

@@ -13,7 +13,8 @@
 //    1. Legacy pass manager:
 //      $ opt -load <BUILD_DIR>/lib/libMBASub.so --legacy-mba-sub <bitcode-file>
 //    2. New pass maanger:
-//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libMBASub.so -passes=-"mba-sub" <bitcode-file>
+//      $ opt -load-pass-plugin <BUILD_DIR>/lib/libMBASub.so `\`
+//        -passes=-"mba-sub" <bitcode-file>
 //
 //  [1] "Hacker's Delight" by Henry S. Warren, Jr.
 //
@@ -22,17 +23,9 @@
 #include "MBASub.h"
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstrTypes.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <random>
@@ -137,8 +130,7 @@ llvmGetPassPluginInfo() {
 char LegacyMBASub::ID = 0;
 
 // Register the pass - required for (among others) opt
-static RegisterPass<LegacyMBASub> X("legacy-mba-sub",
-                                    "Mixed Boolean Arithmetic Substitution",
-                                    true, // doesn't modify the CFG => true
-                                    false // not a pure analysis pass => false
-);
+static RegisterPass<LegacyMBASub> X(/*PassArg=*/"legacy-mba-sub",
+                                    /*Name=*/"MBASub",
+                                    /*CFGOnly=*/true,
+                                    /*is_analysis=*/false);
